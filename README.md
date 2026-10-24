@@ -8,10 +8,10 @@ discord.py 2.7（支援 DAVE 語音加密）+ yt-dlp + FFmpeg + Deno，用 Docke
 2. 左側 **Bot**：
    - **Reset Token** → 複製 Token（只會顯示一次）
    - 把 **Public Bot** 關掉，只有你能邀請它
-   - 不需要開任何 Privileged Gateway Intents
+   - 要用聊天功能的話，打開 **Message Content Intent**（其他 Privileged Intents 不用開）
 3. 左側 **OAuth2 → URL Generator**：
    - Scopes：`bot`、`applications.commands`
-   - Bot Permissions：`Connect`、`Speak`、`Send Messages`、`View Channels`
+   - Bot Permissions：`Connect`、`Speak`、`Send Messages`、`View Channels`、`Read Message History`
    - 打開產生的網址，把機器人邀請到你的伺服器
 
 ## 2. 部署到 Ubuntu Server
@@ -37,6 +37,11 @@ docker compose logs -f
 | `/queue` | 查看佇列 |
 | `/volume <0-100>` | 音量 |
 | `/leave` | 離開語音頻道 |
+
+### 聊天
+
+在 `.env` 設定 `LLAMA_API_URL`（llama.cpp 等 OpenAI 相容 API）後，**@機器人** 或 **回覆機器人的訊息** 就能聊天。
+機器人會讀取該頻道最近 `CHAT_HISTORY` 則訊息當上下文，所以能接上大家正在聊的話題。
 
 ## 4. 疑難排解
 

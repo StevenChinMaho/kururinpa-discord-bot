@@ -3,10 +3,12 @@
 import asyncio
 import logging
 import os
+import re
 import subprocess
 from collections import deque
 from dataclasses import dataclass
 
+import aiohttp
 import discord
 import yt_dlp
 from discord import app_commands
@@ -20,6 +22,15 @@ GUILD_ID = os.environ.get("GUILD_ID")            # 填了的話 slash 指令會�
 COOKIES = os.environ.get("YTDLP_COOKIES", "/app/cookies.txt")
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))   # 佇列空了多久後自動離開（秒）
 MAX_PLAYLIST = int(os.environ.get("MAX_PLAYLIST", "50"))    # 一次最多加入幾首播放清單歌曲
+
+LLAMA_API_URL = os.environ.get("LLAMA_API_URL", "").rstrip("/")  # 例如 http://192.168.0.66:8000/v1，留空則不啟用聊天
+LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "")
+CHAT_HISTORY = int(os.environ.get("CHAT_HISTORY", "20"))    # 聊天時讀取頻道最近幾則訊息當上下文
+CHAT_SYSTEM_PROMPT = os.environ.get("CHAT_SYSTEM_PROMPT") or (
+    "你是 Discord 伺服器裡的聊天夥伴兼音樂機器人，名字叫 {name}。"
+    "請用繁體中文、口語、簡短地回覆，像朋友聊天一樣，必要時才分段。"
+    "對話紀錄中每則使用者訊息的開頭是「發言者名稱：」，回覆時不要加這個前綴。"
+)
 
 YDL_BASE = {
     "format": "bestaudio/best",
@@ -83,6 +94,58 @@ def open_stream(url: str) -> subprocess.Popen:
     cmd.append(url)
     # stderr 直接進容器 log，出錯時 docker compose logs 看得到
     return subprocess.Popen(cmd, stdout=subprocess.PIPE)
+
+
+# ---------- 本地 LLM 聊天（llama.cpp OpenAI 相容 API） ----------
+
+THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> list[dict]:
+    """把頻道最近的訊息轉成 OpenAI 格式；機器人自己的訊息是 assistant，其他人是 user。"""
+    history = [m async for m in message.channel.history(limit=CHAT_HISTORY, before=message)]
+    history.reverse()
+    history.append(message)
+
+    me = message.guild.me if message.guild else bot.user
+    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT.format(name=me.display_name)}]
+    for m in history:
+        text = m.clean_content.strip()
+        if not text:
+            continue
+        if m.author.id == bot.user.id:
+            messages.append({"role": "assistant", "content": text})
+        else:
+            messages.append({"role": "user", "content": f"{m.author.display_name}：{text}"})
+    return messages
+
+
+async def chat_completion(session: aiohttp.ClientSession, messages: list[dict]) -> str:
+    headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
+    payload = {
+        "messages": messages,
+        "max_tokens": 1024,
+        "chat_template_kwargs": {"enable_thinking": False},  # Qwen3 關掉思考模式，回得比較快
+    }
+    async with session.post(f"{LLAMA_API_URL}/chat/completions", json=payload, headers=headers) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    text = data["choices"][0]["message"].get("content") or ""
+    return THINK_RE.sub("", text).strip()
+
+
+def split_message(text: str, limit: int = 2000) -> list[str]:
+    """Discord 單則訊息上限 2000 字，盡量在換行處切開。"""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
 
 
 # ---------- 每個伺服器一個播放器 ----------
@@ -168,8 +231,11 @@ class GuildPlayer:
 
 class MusicBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix=commands.when_mentioned, intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.message_content = LLAMA_API_URL != ""  # 聊天要讀訊息內容，需在開發者後台開啟 Message Content Intent
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.players: dict[int, GuildPlayer] = {}
+        self.http_session: aiohttp.ClientSession | None = None
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
@@ -177,6 +243,9 @@ class MusicBot(commands.Bot):
         return self.players[guild.id]
 
     async def setup_hook(self):
+        if LLAMA_API_URL:
+            self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180))
+            log.info("聊天功能已啟用：%s", LLAMA_API_URL)
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -189,8 +258,38 @@ class MusicBot(commands.Bot):
             await self.tree.sync()
             log.info("Slash 指令已全域同步（可能要等一陣子才出現）")
 
+    async def close(self):
+        if self.http_session:
+            await self.http_session.close()
+        await super().close()
+
     async def on_ready(self):
         log.info("已登入：%s (%s)", self.user, self.user.id)
+
+    async def on_message(self, message: discord.Message):
+        # 不呼叫 process_commands：這個機器人只用 slash 指令
+        if message.author.bot or not self.http_session:
+            return
+        replied_to_me = (
+            message.reference is not None
+            and isinstance(message.reference.resolved, discord.Message)
+            and message.reference.resolved.author.id == self.user.id
+        )
+        if not (self.user in message.mentions or replied_to_me):
+            return
+
+        async with message.channel.typing():
+            try:
+                messages = await build_chat_messages(self, message)
+                reply = await chat_completion(self.http_session, messages)
+            except (aiohttp.ClientError, asyncio.TimeoutError, KeyError) as e:
+                log.warning("聊天失敗：%r", e)
+                return await message.reply("⚠️ AI 暫時連不上，等等再試試", mention_author=False)
+
+        chunks = split_message(reply) or ["……（AI 沒有回應）"]
+        await message.reply(chunks[0], mention_author=False)
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
 
     async def on_voice_state_update(self, member, before, after):
         # 語音頻道只剩機器人時自動離開
