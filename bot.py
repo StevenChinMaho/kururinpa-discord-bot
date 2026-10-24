@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 from collections import deque
 from dataclasses import dataclass
 
@@ -94,6 +95,71 @@ def open_stream(url: str) -> subprocess.Popen:
     cmd.append(url)
     # stderr 直接進容器 log，出錯時 docker compose logs 看得到
     return subprocess.Popen(cmd, stdout=subprocess.PIPE)
+
+
+class BufferedPCMAudio(discord.AudioSource):
+    """在背景執行緒預先讀取 PCM，讓 discord.py 每 20ms 取資料時永遠不會卡住。
+    discord.py 的播放迴圈若 read() 卡住，事後會不間隔地狂送封包追進度，
+    造成開頭被吃掉、聽起來加速；緩衝不足時改回傳靜音，維持穩定節奏。"""
+
+    FRAME_SIZE = discord.opus.Encoder.FRAME_SIZE   # 20ms 的 48kHz 雙聲道 16-bit PCM
+    SILENCE = b"\x00" * FRAME_SIZE
+
+    def __init__(self, source: discord.AudioSource, prebuffer: float = 2.0, max_buffer: float = 15.0):
+        self.source = source
+        self.prebuffer_frames = int(prebuffer * 50)
+        self._frames: deque[bytes] = deque()
+        self._max_frames = int(max_buffer * 50)
+        self._cond = threading.Condition()
+        self._eof = False
+        self._closed = False
+        self._buffering = True
+        self._thread = threading.Thread(target=self._fill, daemon=True)
+        self._thread.start()
+
+    def _fill(self):
+        while True:
+            data = self.source.read()
+            with self._cond:
+                if self._closed:
+                    return
+                if not data:
+                    self._eof = True
+                    self._cond.notify_all()
+                    return
+                self._frames.append(data)
+                self._cond.notify_all()
+                while len(self._frames) >= self._max_frames and not self._closed:
+                    self._cond.wait()
+
+    def wait_ready(self, timeout: float) -> bool:
+        """阻塞直到預緩衝完成或串流結束；回傳是否有可播放的資料。"""
+        with self._cond:
+            self._cond.wait_for(lambda: self._eof or len(self._frames) >= self.prebuffer_frames, timeout)
+            return bool(self._frames)
+
+    def read(self) -> bytes:
+        with self._cond:
+            if self._buffering:
+                # 網路卡住導致緩衝見底：先送靜音，攢到約 1 秒再繼續，避免斷斷續續
+                if self._eof or len(self._frames) >= self.prebuffer_frames // 2:
+                    self._buffering = False
+                else:
+                    return self.SILENCE
+            if self._frames:
+                data = self._frames.popleft()
+                self._cond.notify_all()
+                return data
+            if self._eof:
+                return b""
+            self._buffering = True
+            return self.SILENCE
+
+    def cleanup(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+        self.source.cleanup()
 
 
 # ---------- 本地 LLM 聊天（llama.cpp OpenAI 相容 API） ----------
@@ -205,9 +271,23 @@ class GuildPlayer:
                 await self.notify(f"⚠️ 無法播放 **{track.title}**，跳過")
                 continue
 
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(proc.stdout, pipe=True, **FFMPEG_OPTS), volume=self.volume
-            )
+            buffered = BufferedPCMAudio(discord.FFmpegPCMAudio(proc.stdout, pipe=True, **FFMPEG_OPTS))
+            if not await asyncio.to_thread(buffered.wait_ready, 30):
+                buffered.cleanup()
+                if proc.poll() is None:
+                    proc.kill()
+                await asyncio.to_thread(proc.wait)
+                await self.notify(f"⚠️ 無法播放 **{track.title}**，跳過")
+                continue
+            vc = self.guild.voice_client
+            if vc is None or not vc.is_connected():
+                buffered.cleanup()
+                proc.kill()
+                await asyncio.to_thread(proc.wait)
+                self.queue.clear()
+                return
+
+            source = discord.PCMVolumeTransformer(buffered, volume=self.volume)
             self._finished.clear()
             self.current = track
             vc.play(source, after=self._after)
