@@ -43,6 +43,9 @@ docker compose logs -f
 在 `.env` 設定 `LLAMA_API_URL`（llama.cpp 等 OpenAI 相容 API）後，**@機器人** 或 **回覆機器人的訊息** 就能聊天。
 機器人會讀取該頻道最近 `CHAT_HISTORY` 則訊息當上下文，所以能接上大家正在聊的話題。
 
+聊天中也能直接叫它點歌、切歌、問現在在播什麼（例如「@機器人 放首適合讀書的歌」），點播者要在語音頻道裡。
+這需要 llama.cpp 用 `--jinja` 啟動以支援 tool calling。
+
 ## 4. 疑難排解
 
 - **突然不能播**：通常是 YouTube 改版，`docker compose restart` 會自動更新 yt-dlp；還是不行就等 yt-dlp 出新版。

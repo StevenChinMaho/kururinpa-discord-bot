@@ -1,6 +1,7 @@
 """私人 Discord YouTube 音樂機器人（discord.py + yt-dlp + FFmpeg）"""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -32,6 +33,13 @@ CHAT_SYSTEM_PROMPT = os.environ.get("CHAT_SYSTEM_PROMPT") or (
     "請用繁體中文、口語、簡短地回覆，像朋友聊天一樣，必要時才分段。"
     "對話紀錄中每則使用者訊息的開頭是「發言者名稱：」，回覆時不要加這個前綴。"
 )
+CHAT_TOOL_PROMPT = (
+    "你可以用工具真的操作音樂播放：有人想聽歌或要你點歌時呼叫 play_music（一次一首，要多首就分多次呼叫），"
+    "要切歌呼叫 skip_song，問現在在播什麼呼叫 get_queue。"
+    "絕對不要只用文字假裝已經點歌或切歌，一定要呼叫工具，並根據工具回傳的結果回覆。"
+    "點播者是發出最後一則訊息的人。"
+)
+CHAT_MAX_TOOL_ROUNDS = 5   # 一則訊息最多連續呼叫幾輪工具（模型一次只會點一首）
 
 YDL_BASE = {
     "format": "bestaudio/best",
@@ -174,7 +182,10 @@ async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> li
     history.append(message)
 
     me = message.guild.me if message.guild else bot.user
-    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT.format(name=me.display_name)}]
+    system = CHAT_SYSTEM_PROMPT.format(name=me.display_name)
+    if message.guild:
+        system += "\n" + CHAT_TOOL_PROMPT
+    messages = [{"role": "system", "content": system}]
     for m in history:
         text = m.clean_content.strip()
         if not text:
@@ -186,18 +197,24 @@ async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> li
     return messages
 
 
-async def chat_completion(session: aiohttp.ClientSession, messages: list[dict]) -> str:
+async def chat_completion(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    """回傳 assistant message（可能含 tool_calls）。"""
     headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
     payload = {
         "messages": messages,
         "max_tokens": 1024,
         "chat_template_kwargs": {"enable_thinking": False},  # Qwen3 關掉思考模式，回得比較快
     }
+    if tools:
+        payload["tools"] = tools
     async with session.post(f"{LLAMA_API_URL}/chat/completions", json=payload, headers=headers) as resp:
         resp.raise_for_status()
         data = await resp.json()
-    text = data["choices"][0]["message"].get("content") or ""
-    return THINK_RE.sub("", text).strip()
+    return data["choices"][0]["message"]
+
+
+def clean_reply(text: str | None) -> str:
+    return THINK_RE.sub("", text or "").strip()
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
@@ -360,8 +377,7 @@ class MusicBot(commands.Bot):
 
         async with message.channel.typing():
             try:
-                messages = await build_chat_messages(self, message)
-                reply = await chat_completion(self.http_session, messages)
+                reply = await chat_reply(self, message)
             except (aiohttp.ClientError, asyncio.TimeoutError, KeyError) as e:
                 log.warning("聊天失敗：%r", e)
                 return await message.reply("⚠️ AI 暫時連不上，等等再試試", mention_author=False)
@@ -385,6 +401,118 @@ def _vc(interaction: discord.Interaction) -> discord.VoiceClient | None:
     return interaction.guild.voice_client if interaction.guild else None
 
 
+class PlayError(Exception):
+    """可以直接顯示給使用者的點歌錯誤"""
+
+
+async def enqueue(member: discord.Member, text_channel: discord.abc.Messageable, query: str) -> list[Track]:
+    """進入點歌者所在的語音頻道並把搜尋結果加入佇列；slash 指令和聊天點歌共用。"""
+    voice = getattr(member, "voice", None)
+    if not voice or not voice.channel:
+        raise PlayError("你要先進語音頻道 🎧")
+
+    vc = member.guild.voice_client
+    if vc is None:
+        await voice.channel.connect(self_deaf=True)
+    elif vc.channel != voice.channel:
+        await vc.move_to(voice.channel)
+
+    try:
+        tracks = await asyncio.to_thread(search_tracks, query, member.display_name)
+    except Exception as e:  # noqa: BLE001
+        log.warning("搜尋失敗 %s：%s", query, e)
+        raise PlayError("⚠️ 解析失敗，可能是 yt-dlp 需要更新或影片無法播放") from e
+
+    if not tracks:
+        raise PlayError("找不到結果 🤔")
+
+    player = bot.player(member.guild)
+    player.text_channel = text_channel
+    player.add(tracks)
+    return tracks
+
+
+def format_queue(player: GuildPlayer) -> str:
+    lines = []
+    if player.current:
+        lines.append(f"🎵 **正在播放：** {player.current.title} `[{player.current.fmt_duration()}]`")
+    for i, t in enumerate(list(player.queue)[:10], 1):
+        lines.append(f"`{i}.` {t.title} `[{t.fmt_duration()}]`")
+    if len(player.queue) > 10:
+        lines.append(f"…還有 {len(player.queue) - 10} 首")
+    return "\n".join(lines) or "佇列是空的"
+
+
+# ---------- 聊天中的工具呼叫 ----------
+
+CHAT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "play_music",
+        "description": "在語音頻道點一首歌（加入播放佇列）",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "YouTube 搜尋關鍵字（歌手 + 歌名）或 YouTube 網址"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "skip_song",
+        "description": "跳過目前正在播放的歌",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "get_queue",
+        "description": "查看目前正在播放的歌和待播佇列",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+]
+
+
+async def run_tool(name: str, args: dict, message: discord.Message) -> str:
+    """執行模型要求的工具，回傳給模型看的結果文字。"""
+    log.info("聊天工具 %s %s（%s）", name, args, message.author)
+    guild = message.guild
+    if name == "play_music":
+        voice = getattr(message.author, "voice", None)
+        if not voice or not voice.channel:
+            return f"點歌失敗：{message.author.display_name} 不在任何語音頻道，請他先加入語音頻道再點歌"
+        try:
+            tracks = await enqueue(message.author, message.channel, str(args.get("query", "")))
+        except PlayError as e:
+            return f"點歌失敗：{e}"
+        if len(tracks) == 1:
+            return f"已加入佇列：{tracks[0].title}"
+        return f"已加入 {len(tracks)} 首歌"
+    if name == "skip_song":
+        vc = guild.voice_client
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            return "現在沒有在播放"
+        vc.stop()
+        return "已跳過"
+    if name == "get_queue":
+        return format_queue(bot.player(guild))
+    return f"未知的工具：{name}"
+
+
+async def chat_reply(bot: MusicBot, message: discord.Message) -> str:
+    """呼叫 LLM；如果它要求工具就執行並把結果餵回去，直到它給出文字回覆。"""
+    messages = await build_chat_messages(bot, message)
+    for round_ in range(CHAT_MAX_TOOL_ROUNDS + 1):
+        # 最後一輪不給工具，強制它用文字收尾
+        tools = CHAT_TOOLS if message.guild and round_ < CHAT_MAX_TOOL_ROUNDS else None
+        reply = await chat_completion(bot.http_session, messages, tools)
+        calls = reply.get("tool_calls")
+        if not calls:
+            return clean_reply(reply.get("content"))
+        messages.append({"role": "assistant", "content": reply.get("content") or "", "tool_calls": calls})
+        for call in calls:
+            try:
+                args = json.loads(call["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = await run_tool(call["function"]["name"], args, message)
+            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
+    return ""
+
+
 @bot.tree.command(name="play", description="播放 YouTube 網址、播放清單或搜尋關鍵字")
 @app_commands.describe(query="YouTube 網址或關鍵字")
 async def play(interaction: discord.Interaction, query: str):
@@ -393,25 +521,10 @@ async def play(interaction: discord.Interaction, query: str):
         return await interaction.response.send_message("你要先進語音頻道 🎧", ephemeral=True)
 
     await interaction.response.defer(thinking=True)
-
-    vc = _vc(interaction)
-    if vc is None:
-        await voice.channel.connect(self_deaf=True)
-    elif vc.channel != voice.channel:
-        await vc.move_to(voice.channel)
-
     try:
-        tracks = await asyncio.to_thread(search_tracks, query, interaction.user.display_name)
-    except Exception as e:  # noqa: BLE001
-        log.warning("搜尋失敗 %s：%s", query, e)
-        return await interaction.followup.send("⚠️ 解析失敗，可能是 yt-dlp 需要更新或影片無法播放")
-
-    if not tracks:
-        return await interaction.followup.send("找不到結果 🤔")
-
-    player = bot.player(interaction.guild)
-    player.text_channel = interaction.channel
-    player.add(tracks)
+        tracks = await enqueue(interaction.user, interaction.channel, query)
+    except PlayError as e:
+        return await interaction.followup.send(str(e))
 
     if len(tracks) == 1:
         await interaction.followup.send(f"➕ 已加入佇列：**{tracks[0].title}**")
@@ -466,15 +579,7 @@ async def leave(interaction: discord.Interaction):
 
 @bot.tree.command(name="queue", description="查看播放佇列")
 async def queue(interaction: discord.Interaction):
-    player = bot.player(interaction.guild)
-    lines = []
-    if player.current:
-        lines.append(f"🎵 **正在播放：** {player.current.title} `[{player.current.fmt_duration()}]`")
-    for i, t in enumerate(list(player.queue)[:10], 1):
-        lines.append(f"`{i}.` {t.title} `[{t.fmt_duration()}]`")
-    if len(player.queue) > 10:
-        lines.append(f"…還有 {len(player.queue) - 10} 首")
-    await interaction.response.send_message("\n".join(lines) or "佇列是空的")
+    await interaction.response.send_message(format_queue(bot.player(interaction.guild)))
 
 
 @bot.tree.command(name="volume", description="調整音量（0–100）")
