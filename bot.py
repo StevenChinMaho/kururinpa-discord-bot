@@ -33,6 +33,8 @@ LLAMA_API_URL = os.environ.get("LLAMA_API_URL", "").rstrip("/")  # 例如 http:/
 LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "")
 CHAT_HISTORY = int(os.environ.get("CHAT_HISTORY", "20"))    # 聊天時讀取頻道最近幾則訊息當上下文
 CHAT_THINKING = os.environ.get("CHAT_THINKING", "true").lower() in ("1", "true", "yes", "on")  # 回覆前先思考（較慢但較聰明）
+# 思考力度：xhigh / medium / low，由模型的 chat template 轉成 system 指示（軟性引導）
+CHAT_REASONING_EFFORT = os.environ.get("CHAT_REASONING_EFFORT", "xhigh")
 CHAT_THINKING_BUDGET = int(os.environ.get("CHAT_THINKING_BUDGET", "1024"))  # 思考最多幾個 token，到了就強制開始回答
 CHAT_ANSWER_TOKENS = 2048  # 思考之外留給回覆本身的 token
 CHAT_SYSTEM_PROMPT = os.environ.get("CHAT_SYSTEM_PROMPT") or (
@@ -222,7 +224,7 @@ async def chat_completion(session: aiohttp.ClientSession, messages: list[dict], 
     payload = {
         "messages": messages,
         "max_tokens": CHAT_ANSWER_TOKENS + (CHAT_THINKING_BUDGET if CHAT_THINKING else 0),
-        "chat_template_kwargs": {"enable_thinking": CHAT_THINKING},
+        "chat_template_kwargs": {"enable_thinking": CHAT_THINKING, "reasoning_effort": CHAT_REASONING_EFFORT},
         "reasoning_format": "deepseek",   # 思考內容放到 reasoning_content，不混進回覆
     }
     if CHAT_THINKING:
