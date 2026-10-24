@@ -42,6 +42,11 @@ CHAT_SYSTEM_PROMPT = os.environ.get("CHAT_SYSTEM_PROMPT") or (
     "請用繁體中文、口語、簡短地回覆，像朋友聊天一樣，必要時才分段。"
     "對話紀錄中每則使用者訊息的開頭是「發言者名稱：」，回覆時不要加這個前綴。"
 )
+# 不論是否自訂 CHAT_SYSTEM_PROMPT 都會加上，避免它順口評論上下文裡無關的訊息
+CHAT_FOCUS_PROMPT = (
+    "只回應最後一則訊息；前面的對話紀錄只是背景參考，用來理解話題，"
+    "除非最後一則訊息有提到，否則不要主動評論或回應前面其他人的訊息。"
+)
 CHAT_TOOL_PROMPT = (
     "你可以用工具真的操作音樂播放：有人想聽歌或要你點歌時呼叫 play_music（一次一首，要多首就分多次呼叫），"
     "要切歌呼叫 skip_song，問現在在播什麼呼叫 get_queue。"
@@ -201,6 +206,7 @@ async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> li
 
     me = message.guild.me if message.guild else bot.user
     system = CHAT_SYSTEM_PROMPT.format(name=me.display_name)
+    system += "\n" + CHAT_FOCUS_PROMPT
     system += f"\n現在時間：{datetime.now().astimezone():%Y-%m-%d %H:%M (%Z)}。"
     if message.guild:
         system += "\n" + CHAT_TOOL_PROMPT
