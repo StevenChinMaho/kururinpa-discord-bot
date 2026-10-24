@@ -1,0 +1,9 @@
+services:
+  musicbot:
+    build: .
+    container_name: discord-musicbot
+    restart: unless-stopped
+    env_file: .env
+    # 如果遇到「Sign in to confirm you're not a bot」，匯出 cookies.txt 後取消註解
+    # volumes:
+    #   - ./cookies.txt:/app/cookies.txt:ro
