@@ -1,1 +1,27 @@
+# 機密設定
 .env
+.env.*
+!.env.example
+
+# YouTube cookies（含帳號登入資訊）
+cookies.txt
+*.cookies.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 編輯器 / 系統
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日誌與暫存
+*.log
