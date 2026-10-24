@@ -1,2 +1,4 @@
 discord.py[voice]>=2.7.1
 yt-dlp[default]
+mcp>=1.30
+mcp-server-calculator

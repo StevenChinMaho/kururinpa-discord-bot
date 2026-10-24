@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "calculator": {
+      "command": "python",
+      "args": ["-m", "mcp_server_calculator"]
+    },
+    "searxng": {
+      "command": "deno",
+      "args": ["run", "-A", "npm:mcp-searxng@2.7.0"],
+      "env": { "SEARXNG_URL": "http://searxng:8080" },
+      "tools": ["searxng_web_search", "web_url_read"]
+    }
+  }
+}

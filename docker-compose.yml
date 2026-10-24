@@ -4,6 +4,25 @@ services:
     container_name: discord-musicbot
     restart: unless-stopped
     env_file: .env
-    # 如果遇到「Sign in to confirm you're not a bot」，匯出 cookies.txt 後取消註解
-    # volumes:
-    #   - ./cookies.txt:/app/cookies.txt:ro
+    depends_on:
+      - searxng
+    volumes:
+      # MCP server 設定，改完 docker compose restart musicbot 即可生效
+      - ./mcp_servers.json:/app/mcp_servers.json:ro
+      # Deno 下載的 npm 套件快取（npm 類 MCP server 用），避免每次啟動重新下載
+      - deno-cache:/root/.cache/deno
+      # 如果遇到「Sign in to confirm you're not a bot」，匯出 cookies.txt 後取消註解
+      # - ./cookies.txt:/app/cookies.txt:ro
+
+  # 自架搜尋引擎，給聊天的網路搜尋工具用；不對外開 port，只有機器人連得到
+  searxng:
+    image: searxng/searxng:latest
+    container_name: musicbot-searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+volumes:
+  deno-cache:

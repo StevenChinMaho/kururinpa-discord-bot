@@ -8,13 +8,17 @@ import re
 import subprocess
 import threading
 from collections import deque
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from datetime import datetime
 
 import aiohttp
 import discord
 import yt_dlp
 from discord import app_commands
 from discord.ext import commands
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import get_default_environment, stdio_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("musicbot")
@@ -39,7 +43,14 @@ CHAT_TOOL_PROMPT = (
     "絕對不要只用文字假裝已經點歌或切歌，一定要呼叫工具，並根據工具回傳的結果回覆。"
     "點播者是發出最後一則訊息的人。"
 )
+CHAT_MCP_PROMPT = (
+    "需要最新資訊、新聞或你不確定的事實時，先用網路搜尋工具查再回答，並附上參考網址；"
+    "數學計算一律用計算工具，不要自己心算。"
+)
 CHAT_MAX_TOOL_ROUNDS = 5   # 一則訊息最多連續呼叫幾輪工具（模型一次只會點一首）
+
+MCP_CONFIG = os.environ.get("MCP_CONFIG", "/app/mcp_servers.json")   # MCP server 設定檔，不存在就不載入
+MCP_RESULT_LIMIT = 6000    # 工具結果最多回傳幾個字給模型，避免網頁全文塞爆 context
 
 YDL_BASE = {
     "format": "bestaudio/best",
@@ -173,6 +184,8 @@ class BufferedPCMAudio(discord.AudioSource):
 # ---------- 本地 LLM 聊天（llama.cpp OpenAI 相容 API） ----------
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+# 模型偶爾會把工具呼叫或思考標籤當成純文字吐出來，不能顯示給使用者
+LEAKED_TAGS_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|$)|</?think>", re.DOTALL)
 
 
 async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> list[dict]:
@@ -183,8 +196,11 @@ async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> li
 
     me = message.guild.me if message.guild else bot.user
     system = CHAT_SYSTEM_PROMPT.format(name=me.display_name)
+    system += f"\n現在時間：{datetime.now().astimezone():%Y-%m-%d %H:%M (%Z)}。"
     if message.guild:
         system += "\n" + CHAT_TOOL_PROMPT
+    if bot.mcp.tools:
+        system += "\n" + CHAT_MCP_PROMPT
     messages = [{"role": "system", "content": system}]
     for m in history:
         text = m.clean_content.strip()
@@ -214,7 +230,7 @@ async def chat_completion(session: aiohttp.ClientSession, messages: list[dict], 
 
 
 def clean_reply(text: str | None) -> str:
-    return THINK_RE.sub("", text or "").strip()
+    return LEAKED_TAGS_RE.sub("", THINK_RE.sub("", text or "")).strip()
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
@@ -229,6 +245,95 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     if text:
         chunks.append(text)
     return chunks
+
+
+# ---------- MCP 工具（網路搜尋、計算機…） ----------
+
+class MCPManager:
+    """連接 mcp_servers.json 裡的 MCP server，把它們的工具轉成 OpenAI 格式給聊天用。
+    MCP SDK 的連線必須在同一個 task 裡開啟和關閉，所以由一個常駐 task 持有所有連線。"""
+
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.tools: list[dict] = []
+        self._sessions: dict[str, ClientSession] = {}   # 工具名稱 → 提供它的 server
+        self._ready = asyncio.Event()
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+    async def start(self):
+        if not self.config_path or not os.path.isfile(self.config_path):
+            log.info("找不到 MCP 設定檔 %s，不載入 MCP 工具", self.config_path)
+            return
+        self._task = asyncio.create_task(self._run())
+        await self._ready.wait()
+
+    async def close(self):
+        if self._task:
+            self._stop.set()
+            try:
+                await asyncio.wait_for(self._task, 10)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
+
+    def has(self, name: str) -> bool:
+        return name in self._sessions
+
+    async def _run(self):
+        try:
+            with open(self.config_path, encoding="utf-8") as f:
+                servers = json.load(f).get("mcpServers", {})
+            async with AsyncExitStack() as stack:
+                for name, cfg in servers.items():
+                    try:
+                        async with asyncio.timeout(180):   # 第一次啟動 npm 類 server 要下載套件
+                            await self._connect(stack, name, cfg)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("MCP server %s 啟動失敗：%r", name, e)
+                self._ready.set()
+                await self._stop.wait()
+        except Exception:  # noqa: BLE001
+            log.exception("MCP 管理器錯誤")
+        finally:
+            self._ready.set()
+
+    async def _connect(self, stack: AsyncExitStack, name: str, cfg: dict):
+        # 只給預設的安全環境變數，不把 Discord token 等機密傳給第三方 server
+        env = {**get_default_environment(), **cfg.get("env", {})}
+        params = StdioServerParameters(command=cfg["command"], args=cfg.get("args", []), env=env)
+        read, write = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+
+        allowed = cfg.get("tools")   # 可選：只開放部分工具
+        loaded = []
+        for tool in (await session.list_tools()).tools:
+            if allowed and tool.name not in allowed:
+                continue
+            if tool.name in self._sessions:
+                log.warning("MCP 工具名稱重複，略過 %s/%s", name, tool.name)
+                continue
+            self._sessions[tool.name] = session
+            self.tools.append({"type": "function", "function": {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+            }})
+            loaded.append(tool.name)
+        log.info("MCP server %s 已連線，工具：%s", name, ", ".join(loaded))
+
+    async def call(self, name: str, args: dict) -> str:
+        try:
+            result = await asyncio.wait_for(self._sessions[name].call_tool(name, args), 60)
+        except Exception as e:  # noqa: BLE001
+            log.warning("MCP 工具 %s 失敗：%r", name, e)
+            return f"工具執行失敗：{e!r}"
+        text = "\n".join(c.text for c in result.content if getattr(c, "type", "") == "text")
+        if result.isError:
+            text = f"工具執行失敗：{text}"
+        if len(text) > MCP_RESULT_LIMIT:
+            text = text[:MCP_RESULT_LIMIT] + "\n…（內容過長已截斷）"
+        return text or "（沒有結果）"
 
 
 # ---------- 每個伺服器一個播放器 ----------
@@ -333,6 +438,7 @@ class MusicBot(commands.Bot):
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.players: dict[int, GuildPlayer] = {}
         self.http_session: aiohttp.ClientSession | None = None
+        self.mcp = MCPManager(MCP_CONFIG)
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
@@ -342,6 +448,7 @@ class MusicBot(commands.Bot):
     async def setup_hook(self):
         if LLAMA_API_URL:
             self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180))
+            await self.mcp.start()
             log.info("聊天功能已啟用：%s", LLAMA_API_URL)
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
@@ -356,6 +463,7 @@ class MusicBot(commands.Bot):
             log.info("Slash 指令已全域同步（可能要等一陣子才出現）")
 
     async def close(self):
+        await self.mcp.close()
         if self.http_session:
             await self.http_session.close()
         await super().close()
@@ -489,6 +597,8 @@ async def run_tool(name: str, args: dict, message: discord.Message) -> str:
         return "已跳過"
     if name == "get_queue":
         return format_queue(bot.player(guild))
+    if bot.mcp.has(name):
+        return await bot.mcp.call(name, args)
     return f"未知的工具：{name}"
 
 
@@ -496,8 +606,13 @@ async def chat_reply(bot: MusicBot, message: discord.Message) -> str:
     """呼叫 LLM；如果它要求工具就執行並把結果餵回去，直到它給出文字回覆。"""
     messages = await build_chat_messages(bot, message)
     for round_ in range(CHAT_MAX_TOOL_ROUNDS + 1):
-        # 最後一輪不給工具，強制它用文字收尾
-        tools = CHAT_TOOLS if message.guild and round_ < CHAT_MAX_TOOL_ROUNDS else None
+        if round_ < CHAT_MAX_TOOL_ROUNDS:
+            # 音樂工具只在伺服器裡有用；MCP 工具私訊也能用
+            tools = (CHAT_TOOLS if message.guild else []) + bot.mcp.tools or None
+        else:
+            # 最後一輪不給工具，並明確要它收尾，否則它會把工具呼叫當文字吐出來
+            tools = None
+            messages.append({"role": "user", "content": "（系統提示：工具使用次數已達上限，請根據目前取得的資訊直接回覆。）"})
         reply = await chat_completion(bot.http_session, messages, tools)
         calls = reply.get("tool_calls")
         if not calls:

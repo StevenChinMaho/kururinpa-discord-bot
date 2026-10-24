@@ -1,0 +1,18 @@
+# 只給機器人內部使用的 SearXNG，完整選項見 https://docs.searxng.org/admin/settings/
+use_default_settings: true
+
+general:
+  instance_name: musicbot-search
+
+server:
+  # 實際的 secret_key 由環境變數 SEARXNG_SECRET 覆蓋（寫在 .env）
+  secret_key: "change-me"
+  limiter: false          # 只有機器人在用，不需要防濫用（開啟還要額外架 valkey）
+  image_proxy: false
+
+search:
+  safe_search: 0
+  # MCP server 透過 JSON API 查詢
+  formats:
+    - html
+    - json

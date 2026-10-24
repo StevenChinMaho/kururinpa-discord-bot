@@ -46,6 +46,17 @@ docker compose logs -f
 聊天中也能直接叫它點歌、切歌、問現在在播什麼（例如「@機器人 放首適合讀書的歌」），點播者要在語音頻道裡。
 這需要 llama.cpp 用 `--jinja` 啟動以支援 tool calling。
 
+### MCP 工具（網路搜尋、計算機）
+
+聊天時 AI 會自動使用 [mcp_servers.json](mcp_servers.json) 裡設定的 MCP server：
+
+- **calculator**：數學計算
+- **searxng**：網路搜尋與讀取網頁，搜尋引擎是 docker-compose 裡一起啟動的自架 SearXNG（不對外開 port）
+
+格式和 Claude Desktop 相同（`command` / `args` / `env`），另外可以用 `tools` 限制只開放部分工具。
+Python 套件的 server 要加進 `requirements.txt`；npm 套件的 server 用 `deno run -A npm:套件名` 執行，不用另外裝 Node。
+改完設定執行 `docker compose restart musicbot` 即可，啟動 log 會列出載入的工具。
+
 ## 4. 疑難排解
 
 - **突然不能播**：通常是 YouTube 改版，`docker compose restart` 會自動更新 yt-dlp；還是不行就等 yt-dlp 出新版。
