@@ -32,6 +32,8 @@ MAX_PLAYLIST = int(os.environ.get("MAX_PLAYLIST", "50"))    # 一次最多加入
 LLAMA_API_URL = os.environ.get("LLAMA_API_URL", "").rstrip("/")  # 例如 http://192.168.0.66:8000/v1，留空則不啟用聊天
 LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "")
 CHAT_HISTORY = int(os.environ.get("CHAT_HISTORY", "20"))    # 聊天時讀取頻道最近幾則訊息當上下文
+CHAT_THINKING = os.environ.get("CHAT_THINKING", "true").lower() in ("1", "true", "yes", "on")  # 回覆前先思考（較慢但較聰明）
+CHAT_MAX_TOKENS = int(os.environ.get("CHAT_MAX_TOKENS", "4096"))  # 每次回應的 token 上限（含思考）
 CHAT_SYSTEM_PROMPT = os.environ.get("CHAT_SYSTEM_PROMPT") or (
     "你是 Discord 伺服器裡的聊天夥伴兼音樂機器人，名字叫 {name}。"
     "請用繁體中文、口語、簡短地回覆，像朋友聊天一樣，必要時才分段。"
@@ -213,20 +215,29 @@ async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> li
     return messages
 
 
-async def chat_completion(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict] | None = None) -> dict:
+async def chat_completion(
+    session: aiohttp.ClientSession, messages: list[dict], tools: list[dict] | None = None, thinking: bool = CHAT_THINKING
+) -> dict:
     """回傳 assistant message（可能含 tool_calls）。"""
     headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
     payload = {
         "messages": messages,
-        "max_tokens": 1024,
-        "chat_template_kwargs": {"enable_thinking": False},  # Qwen3 關掉思考模式，回得比較快
+        "max_tokens": CHAT_MAX_TOKENS,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+        "reasoning_format": "deepseek",   # 思考內容放到 reasoning_content，不混進回覆
     }
     if tools:
         payload["tools"] = tools
     async with session.post(f"{LLAMA_API_URL}/chat/completions", json=payload, headers=headers) as resp:
         resp.raise_for_status()
         data = await resp.json()
-    return data["choices"][0]["message"]
+    choice = data["choices"][0]
+    msg = choice["message"]
+    if thinking and choice.get("finish_reason") == "length" and not msg.get("content") and not msg.get("tool_calls"):
+        # 想太久把 token 用完了還沒開口：改成不思考再回一次
+        log.info("思考超過 %d tokens，改用不思考模式重試", CHAT_MAX_TOKENS)
+        return await chat_completion(session, messages, tools, thinking=False)
+    return msg
 
 
 def clean_reply(text: str | None) -> str:
@@ -447,7 +458,7 @@ class MusicBot(commands.Bot):
 
     async def setup_hook(self):
         if LLAMA_API_URL:
-            self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180))
+            self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600))
             await self.mcp.start()
             log.info("聊天功能已啟用：%s", LLAMA_API_URL)
         if GUILD_ID:
