@@ -11,7 +11,7 @@ discord.py 2.7（支援 DAVE 語音加密）+ yt-dlp + FFmpeg + Deno，用 Docke
    - 要用聊天功能的話，打開 **Message Content Intent**（其他 Privileged Intents 不用開）
 3. 左側 **OAuth2 → URL Generator**：
    - Scopes：`bot`、`applications.commands`
-   - Bot Permissions：`Connect`、`Speak`、`Send Messages`、`View Channels`、`Read Message History`
+   - Bot Permissions：`Connect`、`Speak`、`Send Messages`、`View Channels`、`Read Message History`、`Add Reactions`
    - 打開產生的網址，把機器人邀請到你的伺服器
 
 ## 2. 部署到 Ubuntu Server
