@@ -646,6 +646,7 @@ class MusicBot(commands.Bot):
         intents.message_content = LLAMA_API_URL != ""  # 聊天要讀訊息內容，需在開發者後台開啟 Message Content Intent
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.players: dict[int, GuildPlayer] = {}
+        self._voice_locks: dict[int, asyncio.Lock] = {}
         self.http_session: aiohttp.ClientSession | None = None
         self.mcp = MCPManager(MCP_CONFIG)
         os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
@@ -653,6 +654,9 @@ class MusicBot(commands.Bot):
         self.active_chats = 0                     # 正在等 LLM 回覆的對話數，背景摘要會讓位
         self._summarizing: set[int] = set()
         self._last_chime_in: dict[int, float] = {}
+
+    def voice_lock(self, guild: discord.Guild) -> asyncio.Lock:
+        return self._voice_locks.setdefault(guild.id, asyncio.Lock())
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
@@ -730,6 +734,10 @@ class MusicBot(commands.Bot):
             log.warning("聊天失敗：%r", e)
             await live.fail("⚠️ AI 暫時連不上，等等再試試")
             return
+        except Exception:  # noqa: BLE001
+            log.exception("聊天發生非預期錯誤")
+            await live.fail("⚠️ 出了點問題，等等再試試")
+            return
         finally:
             self.active_chats -= 1
             try:
@@ -802,11 +810,20 @@ async def enqueue(member: discord.Member, text_channel: discord.abc.Messageable,
     if not voice or not voice.channel:
         raise PlayError("你要先進語音頻道 🎧")
 
-    vc = member.guild.voice_client
-    if vc is None:
-        await voice.channel.connect(self_deaf=True)
-    elif vc.channel != voice.channel:
-        await vc.move_to(voice.channel)
+    # 同時有兩個人點歌時，避免兩邊都去連線而撞上「Already connected」
+    async with bot.voice_lock(member.guild):
+        vc = member.guild.voice_client
+        if vc is not None and not vc.is_connected():
+            await vc.disconnect(force=True)   # 斷線後殘留的連線物件，清掉重連
+            vc = None
+        try:
+            if vc is None:
+                await voice.channel.connect(self_deaf=True, timeout=20)
+            elif vc.channel != voice.channel:
+                await vc.move_to(voice.channel)
+        except (asyncio.TimeoutError, discord.ClientException) as e:
+            log.warning("連接語音頻道失敗：%r", e)
+            raise PlayError("⚠️ 連不上語音頻道，等一下再試試") from e
 
     try:
         tracks = await asyncio.to_thread(search_tracks, query, member.display_name)
@@ -898,9 +915,19 @@ def tool_status(name: str, args: dict) -> str | None:
 
 
 async def run_tool(name: str, args: dict, turn: ChatTurn) -> str:
-    """執行模型要求的工具，回傳給模型看的結果文字。"""
+    """執行模型要求的工具，回傳給模型看的結果文字。出錯時也回傳文字，讓模型照實告訴使用者。"""
+    log.info("聊天工具 %s %s（%s）", name, args, turn.message.author)
+    try:
+        result = await _run_tool(name, args, turn)
+    except Exception as e:  # noqa: BLE001
+        log.exception("聊天工具 %s 執行失敗", name)
+        return f"工具執行失敗：{e!r}"
+    log.info("聊天工具 %s 結果：%s", name, result[:200].replace("\n", " "))
+    return result
+
+
+async def _run_tool(name: str, args: dict, turn: ChatTurn) -> str:
     message = turn.message
-    log.info("聊天工具 %s %s（%s）", name, args, message.author)
     guild = message.guild
     gid = memory_guild_id(message)
     if name == "play_music":
