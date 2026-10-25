@@ -9,6 +9,8 @@ services:
     volumes:
       # MCP server 設定，改完 docker compose restart musicbot 即可生效
       - ./mcp_servers.json:/app/mcp_servers.json:ro
+      # 長期記憶與頻道摘要（SQLite）
+      - ./data:/app/data
       # Deno 下載的 npm 套件快取（npm 類 MCP server 用），避免每次啟動重新下載
       - deno-cache:/root/.cache/deno
       # 如果遇到「Sign in to confirm you're not a bot」，匯出 cookies.txt 後取消註解

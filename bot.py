@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import threading
+import time
 from collections import deque
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -20,6 +22,8 @@ from discord.ext import commands
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import get_default_environment, stdio_client
 
+from memory import MemoryStore
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("musicbot")
 
@@ -31,7 +35,12 @@ MAX_PLAYLIST = int(os.environ.get("MAX_PLAYLIST", "50"))    # 一次最多加入
 
 LLAMA_API_URL = os.environ.get("LLAMA_API_URL", "").rstrip("/")  # 例如 http://192.168.0.66:8000/v1，留空則不啟用聊天
 LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "")
-CHAT_HISTORY = int(os.environ.get("CHAT_HISTORY", "20"))    # 聊天時讀取頻道最近幾則訊息當上下文
+CHAT_HISTORY = int(os.environ.get("CHAT_HISTORY", "20"))    # 聊天時讀取頻道最近幾則原始訊息，更早的靠頻道摘要
+# 訊息裡出現這些名字也會回應（逗號分隔；機器人自己的名稱一律算）
+CHAT_NAMES = [n.strip() for n in os.environ.get("CHAT_NAMES", "").split(",") if n.strip()]
+CHAT_CHIME_IN = float(os.environ.get("CHAT_CHIME_IN", "0.03"))                 # 沒被叫到時主動插話的機率（0 關閉）
+CHAT_CHIME_IN_COOLDOWN = int(os.environ.get("CHAT_CHIME_IN_COOLDOWN", "600"))  # 同頻道主動插話的最短間隔（秒）
+STREAM_EDIT_INTERVAL = 1.5   # 串流時多久編輯一次訊息（Discord 限制每 5 秒約 5 次）
 CHAT_THINKING = os.environ.get("CHAT_THINKING", "true").lower() in ("1", "true", "yes", "on")  # 回覆前先思考（較慢但較聰明）
 # 思考力度：xhigh / medium / low，由模型的 chat template 轉成 system 指示（軟性引導）
 CHAT_REASONING_EFFORT = os.environ.get("CHAT_REASONING_EFFORT", "xhigh")
@@ -57,7 +66,30 @@ CHAT_MCP_PROMPT = (
     "需要最新資訊、新聞或你不確定的事實時，先用網路搜尋工具查再回答，並附上參考網址；"
     "數學計算一律用計算工具，不要自己心算。"
 )
+CHAT_MEMORY_PROMPT = (
+    "你有長期記憶。聽到值得長期記住的事就呼叫 remember："
+    "scope=user 記在發言者身上（喜好、暱稱、生日、近況），scope=server 記成全伺服器共享（內梗、規則、大事）。"
+    "不要記瑣碎或一次性的內容，也不要重複記已經記得的事。"
+    "想不起某人或某事時用 recall 搜尋；有人要你忘記某件事時用 forget。"
+)
+CHAT_REACTION_PROMPT = "你可以用 add_reaction 幫最後一則訊息按表情符號，適合簡單附和或開玩笑時使用。"
+CHAT_CHIME_IN_PROMPT = (
+    "（系統提示：這次沒有人叫你，你只是在旁邊看到大家聊天。"
+    "只有能自然地補充有趣或有幫助的話時才開口，而且要很短；也可以只用 add_reaction 按個表情。"
+    "如果沒什麼好說的，只回覆 [PASS]。）"
+)
 CHAT_MAX_TOOL_ROUNDS = 5   # 一則訊息最多連續呼叫幾輪工具（模型一次只會點一首）
+
+MEMORY_DB = os.environ.get("MEMORY_DB", "/app/data/memory.db")
+MEMORY_MAX_PER_SCOPE = 50  # 每個人／伺服器最多記幾條
+MEMORY_IN_PROMPT = 20      # 每次聊天自動帶入幾條發言者記憶與伺服器記憶
+SUMMARY_TRIGGER = int(os.environ.get("SUMMARY_TRIGGER", "30"))  # 上下文窗口外累積幾則未摘要訊息就壓縮進頻道摘要
+SUMMARY_MAX_FETCH = 200    # 一次最多壓縮幾則
+SUMMARY_PROMPT = (
+    "你負責整理 Discord 頻道的對話摘要。把「先前摘要」和「新的對話」合併成一份新的摘要："
+    "用繁體中文條列重點（誰聊了什麼話題、做了什麼決定、有什麼還沒完的事、重要的梗），保留人名，"
+    "去掉寒暄和沒有意義的內容，舊的瑣事可以刪減，總長不超過 400 字。只輸出摘要本身。"
+)
 
 MCP_CONFIG = os.environ.get("MCP_CONFIG", "/app/mcp_servers.json")   # MCP server 設定檔，不存在就不載入
 MCP_RESULT_LIMIT = 6000    # 工具結果最多回傳幾個字給模型，避免網頁全文塞爆 context
@@ -198,8 +230,26 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 LEAKED_TAGS_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|$)|</?think>", re.DOTALL)
 
 
-async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> list[dict]:
-    """把頻道最近的訊息轉成 OpenAI 格式；機器人自己的訊息是 assistant，其他人是 user。"""
+THINKING_PLACEHOLDER = "💭 思考中"
+
+
+def history_text(bot: commands.Bot, m: discord.Message) -> str | None:
+    """把一則頻道訊息轉成給模型看的文字；機器人自己的訊息去掉思考中提示與頁尾小字。"""
+    text = m.clean_content.strip()
+    if m.author.id == bot.user.id:
+        if text.startswith(THINKING_PLACEHOLDER):
+            return None
+        text = "\n".join(line for line in text.splitlines() if not line.startswith("-# ")).strip()
+    return text or None
+
+
+def memory_guild_id(message: discord.Message) -> int:
+    return message.guild.id if message.guild else 0   # 私訊的記憶存在 guild 0
+
+
+async def build_chat_messages(bot: commands.Bot, message: discord.Message, chime_in: bool = False) -> list[dict]:
+    """組 prompt：人設與規則 + 長期記憶 + 頻道摘要 + 最近的原始訊息。
+    機器人自己的訊息是 assistant，其他人是 user。"""
     history = [m async for m in message.channel.history(limit=CHAT_HISTORY, before=message)]
     history.reverse()
     history.append(message)
@@ -208,39 +258,184 @@ async def build_chat_messages(bot: commands.Bot, message: discord.Message) -> li
     system = CHAT_SYSTEM_PROMPT.format(name=me.display_name)
     system += "\n" + CHAT_FOCUS_PROMPT
     system += f"\n現在時間：{datetime.now().astimezone():%Y-%m-%d %H:%M (%Z)}。"
-    if message.guild:
+    if message.guild and not chime_in:
         system += "\n" + CHAT_TOOL_PROMPT
-    if bot.mcp.tools:
+    if bot.mcp.tools and not chime_in:
         system += "\n" + CHAT_MCP_PROMPT
+    if not chime_in:
+        system += "\n" + CHAT_MEMORY_PROMPT
+    system += "\n" + CHAT_REACTION_PROMPT
+
+    gid = memory_guild_id(message)
+    if mine := bot.memory.list_for(gid, message.author.id, MEMORY_IN_PROMPT):
+        system += f"\n\n關於 {message.author.display_name} 你記得：\n" + "\n".join(f"- {m.fmt()}" for m in mine)
+    if message.guild and (shared := bot.memory.list_for(gid, None, MEMORY_IN_PROMPT)):
+        system += "\n\n伺服器共同記憶：\n" + "\n".join(f"- {m.fmt()}" for m in shared)
+    if summary := bot.memory.get_summary(message.channel.id):
+        system += f"\n\n這個頻道稍早的對話摘要（更早之前的內容）：\n{summary[0]}"
+
     messages = [{"role": "system", "content": system}]
     for m in history:
-        text = m.clean_content.strip()
+        text = history_text(bot, m)
         if not text:
             continue
         if m.author.id == bot.user.id:
             messages.append({"role": "assistant", "content": text})
         else:
             messages.append({"role": "user", "content": f"{m.author.display_name}：{text}"})
+    if chime_in:
+        messages.append({"role": "user", "content": CHAT_CHIME_IN_PROMPT})
     return messages
 
 
-async def chat_completion(session: aiohttp.ClientSession, messages: list[dict], tools: list[dict] | None = None) -> dict:
-    """回傳 assistant message（可能含 tool_calls）。"""
+async def chat_completion(
+    session: aiohttp.ClientSession,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    on_delta=None,
+    thinking: bool = CHAT_THINKING,
+    answer_tokens: int = CHAT_ANSWER_TOKENS,
+) -> dict:
+    """回傳 assistant message（可能含 tool_calls）。
+    給了 on_delta(reasoning, content) 就用串流，每收到一段就以目前累積的文字呼叫它。"""
     headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
     payload = {
         "messages": messages,
-        "max_tokens": CHAT_ANSWER_TOKENS + (CHAT_THINKING_BUDGET if CHAT_THINKING else 0),
-        "chat_template_kwargs": {"enable_thinking": CHAT_THINKING, "reasoning_effort": CHAT_REASONING_EFFORT},
+        "max_tokens": answer_tokens + (CHAT_THINKING_BUDGET if thinking else 0),
+        "chat_template_kwargs": {"enable_thinking": thinking, "reasoning_effort": CHAT_REASONING_EFFORT},
         "reasoning_format": "deepseek",   # 思考內容放到 reasoning_content，不混進回覆
+        "stream": on_delta is not None,
     }
-    if CHAT_THINKING:
+    if thinking:
         payload["thinking_budget_tokens"] = CHAT_THINKING_BUDGET   # llama.cpp 會在預算用完時插入 </think> 強制作答
     if tools:
         payload["tools"] = tools
     async with session.post(f"{LLAMA_API_URL}/chat/completions", json=payload, headers=headers) as resp:
         resp.raise_for_status()
-        data = await resp.json()
-    return data["choices"][0]["message"]
+        if on_delta is None:
+            data = await resp.json()
+            return data["choices"][0]["message"]
+
+        # SSE：每行 "data: {...}"，tool_calls 依 index 分段送來，要自己拼起來
+        reasoning, content, calls = "", "", {}
+        async for raw in resp.content:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                continue   # 讀到連線結束為止，提早 break 會讓壞掉的連線被重用
+            chunk = json.loads(data)
+            if not chunk.get("choices"):
+                continue
+            delta = chunk["choices"][0].get("delta") or {}
+            reasoning += delta.get("reasoning_content") or ""
+            content += delta.get("content") or ""
+            for tc in delta.get("tool_calls") or []:
+                call = calls.setdefault(tc.get("index", 0), {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                call["id"] = tc.get("id") or call["id"]
+                fn = tc.get("function") or {}
+                call["function"]["name"] += fn.get("name") or ""
+                call["function"]["arguments"] += fn.get("arguments") or ""
+            on_delta(reasoning, content)
+
+    msg = {"role": "assistant", "content": content, "reasoning_content": reasoning}
+    if calls:
+        msg["tool_calls"] = [calls[i] for i in sorted(calls)]
+    return msg
+
+
+class LiveReply:
+    """先回一則「思考中」訊息，生成過程中節流地編輯它，避免撞到 Discord 的編輯頻率限制。"""
+
+    def __init__(self, source: discord.Message):
+        self.source = source
+        self.msg: discord.Message | None = None
+        self.status = THINKING_PLACEHOLDER
+        self.text = ""
+        self.started = time.monotonic()
+        self._shown = ""
+        self._task: asyncio.Task | None = None
+
+    def elapsed(self) -> int:
+        return int(time.monotonic() - self.started)
+
+    async def start(self):
+        self.msg = await self.source.reply(f"{self.status}…", mention_author=False)
+        self._shown = self.msg.content
+        self._task = asyncio.create_task(self._loop())
+
+    def update(self, text: str | None = None, status: str | None = None):
+        if text is not None:
+            self.text = text
+        if status is not None:
+            self.status = status
+
+    def _render(self) -> str:
+        if self.text:
+            text = self.text if len(self.text) <= 1900 else self.text[:1900] + " …"
+            return text + " ▌"
+        return f"{self.status}…（{self.elapsed()} 秒）"
+
+    async def _loop(self):
+        while True:
+            await asyncio.sleep(STREAM_EDIT_INTERVAL)
+            content = self._render()
+            if content != self._shown:
+                try:
+                    await self.msg.edit(content=content)
+                    self._shown = content
+                except discord.HTTPException:
+                    pass
+
+    async def _stop(self):
+        if self._task:
+            self._task.cancel()
+            self._task = None
+
+    async def finish(self, text: str):
+        await self._stop()
+        footer = f"\n-# 💭 {self.elapsed()} 秒"
+        chunks = split_message(text, limit=2000 - len(footer)) or [""]
+        chunks[-1] += footer
+        await self.msg.edit(content=chunks[0])
+        for chunk in chunks[1:]:
+            await self.source.channel.send(chunk)
+
+    async def delete(self):
+        await self._stop()
+        try:
+            await self.msg.delete()
+        except discord.HTTPException:
+            pass
+
+    async def fail(self, text: str):
+        await self._stop()
+        await self.msg.edit(content=text)
+
+
+async def summarize_channel(bot: commands.Bot, channel: discord.abc.Messageable):
+    """把超出上下文窗口、還沒摘要過的舊訊息併進頻道摘要。"""
+    recent = [m async for m in channel.history(limit=CHAT_HISTORY)]
+    if len(recent) < CHAT_HISTORY:
+        return   # 訊息還不多，窗口就裝得下
+    prev = bot.memory.get_summary(channel.id)
+    summary, last_id = prev if prev else ("", 0)
+    after = discord.Object(id=last_id) if last_id else None
+    pending = [m async for m in channel.history(limit=SUMMARY_MAX_FETCH, before=recent[-1], after=after)]
+    pending.sort(key=lambda m: m.id)
+    lines = [f"{m.author.display_name}：{t}" for m in pending if (t := history_text(bot, m))]
+    if len(lines) < SUMMARY_TRIGGER:
+        return
+
+    messages = [
+        {"role": "system", "content": SUMMARY_PROMPT},
+        {"role": "user", "content": f"先前摘要：\n{summary or '（無）'}\n\n新的對話：\n" + "\n".join(lines)},
+    ]
+    reply = await chat_completion(bot.http_session, messages, thinking=False, answer_tokens=1024)
+    if new := clean_reply(reply.get("content")):
+        bot.memory.set_summary(channel.id, new, pending[-1].id)
+        log.info("頻道 %s 摘要已更新（併入 %d 則訊息）", channel, len(lines))
 
 
 def clean_reply(text: str | None) -> str:
@@ -453,6 +648,11 @@ class MusicBot(commands.Bot):
         self.players: dict[int, GuildPlayer] = {}
         self.http_session: aiohttp.ClientSession | None = None
         self.mcp = MCPManager(MCP_CONFIG)
+        os.makedirs(os.path.dirname(MEMORY_DB), exist_ok=True)
+        self.memory = MemoryStore(MEMORY_DB)
+        self.active_chats = 0                     # 正在等 LLM 回覆的對話數，背景摘要會讓位
+        self._summarizing: set[int] = set()
+        self._last_chime_in: dict[int, float] = {}
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
@@ -461,7 +661,10 @@ class MusicBot(commands.Bot):
 
     async def setup_hook(self):
         if LLAMA_API_URL:
-            self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600))
+            # 不重用連線：串流回應結束後 llama.cpp 會關閉連線，重用會遇到 ServerDisconnectedError
+            self.http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=600), connector=aiohttp.TCPConnector(force_close=True)
+            )
             await self.mcp.start()
             log.info("聊天功能已啟用：%s", LLAMA_API_URL)
         if GUILD_ID:
@@ -489,25 +692,91 @@ class MusicBot(commands.Bot):
         # 不呼叫 process_commands：這個機器人只用 slash 指令
         if message.author.bot or not self.http_session:
             return
-        replied_to_me = (
-            message.reference is not None
-            and isinstance(message.reference.resolved, discord.Message)
-            and message.reference.resolved.author.id == self.user.id
-        )
-        if not (self.user in message.mentions or replied_to_me):
+        if self._is_addressed(message):
+            await self._chat(message)
+        elif self._should_chime_in(message):
+            await self._chime_in(message)
+
+    def _is_addressed(self, message: discord.Message) -> bool:
+        """私訊、被 @、被回覆，或訊息裡叫了機器人的名字。"""
+        if message.guild is None or self.user in message.mentions:
+            return True
+        ref = message.reference
+        if ref is not None and isinstance(ref.resolved, discord.Message) and ref.resolved.author.id == self.user.id:
+            return True
+        names = {message.guild.me.display_name, self.user.name, *CHAT_NAMES}
+        content = message.content.lower()
+        return any(n.lower() in content for n in names)
+
+    def _should_chime_in(self, message: discord.Message) -> bool:
+        if CHAT_CHIME_IN <= 0 or self.active_chats or len(message.content) < 4:
+            return False
+        if time.monotonic() - self._last_chime_in.get(message.channel.id, -1e9) < CHAT_CHIME_IN_COOLDOWN:
+            return False
+        return random.random() < CHAT_CHIME_IN
+
+    async def _chat(self, message: discord.Message):
+        try:
+            await message.add_reaction("👀")
+        except discord.HTTPException:
+            pass
+        live = LiveReply(message)
+        await live.start()
+        turn = ChatTurn(message, live)
+        self.active_chats += 1
+        try:
+            reply = await chat_reply(self, turn)
+        except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, json.JSONDecodeError) as e:
+            log.warning("聊天失敗：%r", e)
+            await live.fail("⚠️ AI 暫時連不上，等等再試試")
             return
-
-        async with message.channel.typing():
+        finally:
+            self.active_chats -= 1
             try:
-                reply = await chat_reply(self, message)
-            except (aiohttp.ClientError, asyncio.TimeoutError, KeyError) as e:
-                log.warning("聊天失敗：%r", e)
-                return await message.reply("⚠️ AI 暫時連不上，等等再試試", mention_author=False)
+                await message.remove_reaction("👀", self.user)
+            except discord.HTTPException:
+                pass
 
-        chunks = split_message(reply) or ["……（AI 沒有回應）"]
-        await message.reply(chunks[0], mention_author=False)
-        for chunk in chunks[1:]:
-            await message.channel.send(chunk)
+        if reply:
+            await live.finish(reply)
+        elif turn.reacted:
+            await live.delete()   # 只按了表情，不用多一則空訊息
+        else:
+            await live.finish("……（AI 沒有回應）")
+        self.schedule_summary(message.channel)
+
+    async def _chime_in(self, message: discord.Message):
+        self._last_chime_in[message.channel.id] = time.monotonic()
+        turn = ChatTurn(message, chime_in=True)
+        self.active_chats += 1
+        try:
+            reply = await chat_reply(self, turn)
+        except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, json.JSONDecodeError) as e:
+            log.warning("主動插話失敗：%r", e)
+            return
+        finally:
+            self.active_chats -= 1
+        reply = reply.replace("[PASS]", "").strip()
+        log.info("主動插話（%s）：%s", message.channel, reply or ("按了表情" if turn.reacted else "略過"))
+        if reply:
+            for chunk in split_message(reply):
+                await message.channel.send(chunk)
+
+    def schedule_summary(self, channel: discord.abc.Messageable):
+        if channel.id in self._summarizing:
+            return
+        self._summarizing.add(channel.id)
+        asyncio.create_task(self._summarize(channel))
+
+    async def _summarize(self, channel: discord.abc.Messageable):
+        try:
+            while self.active_chats:   # 只有一個 slot，有人在等回覆時先讓位
+                await asyncio.sleep(5)
+            await summarize_channel(self, channel)
+        except Exception:  # noqa: BLE001
+            log.exception("頻道摘要失敗")
+        finally:
+            self._summarizing.discard(channel.id)
 
     async def on_voice_state_update(self, member, before, after):
         # 語音頻道只剩機器人時自動離開
@@ -567,31 +836,73 @@ def format_queue(player: GuildPlayer) -> str:
 
 # ---------- 聊天中的工具呼叫 ----------
 
-CHAT_TOOLS = [
-    {"type": "function", "function": {
-        "name": "play_music",
-        "description": "在語音頻道點一首歌（加入播放佇列）",
-        "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "YouTube 搜尋關鍵字（歌手 + 歌名）或 YouTube 網址"},
-        }, "required": ["query"]},
-    }},
-    {"type": "function", "function": {
-        "name": "skip_song",
-        "description": "跳過目前正在播放的歌",
-        "parameters": {"type": "object", "properties": {}},
-    }},
-    {"type": "function", "function": {
-        "name": "get_queue",
-        "description": "查看目前正在播放的歌和待播佇列",
-        "parameters": {"type": "object", "properties": {}},
-    }},
+@dataclass
+class ChatTurn:
+    """一次聊天回覆的狀態"""
+    message: discord.Message           # 觸發回覆的訊息
+    live: LiveReply | None = None      # 串流顯示用；主動插話時為 None
+    chime_in: bool = False
+    reacted: bool = False
+
+
+def _tool(name: str, description: str, properties: dict | None = None, required: list[str] | None = None) -> dict:
+    return {"type": "function", "function": {
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object", "properties": properties or {}, "required": required or []},
+    }}
+
+
+MUSIC_TOOLS = [
+    _tool("play_music", "在語音頻道點一首歌（加入播放佇列）",
+          {"query": {"type": "string", "description": "YouTube 搜尋關鍵字（歌手 + 歌名）或 YouTube 網址"}}, ["query"]),
+    _tool("skip_song", "跳過目前正在播放的歌"),
+    _tool("get_queue", "查看目前正在播放的歌和待播佇列"),
 ]
+MEMORY_TOOLS = [
+    _tool("remember", "把值得長期記住的事存進記憶",
+          {"content": {"type": "string", "description": "要記住的內容，寫成一句完整的話，例如「喜歡五月天」"},
+           "scope": {"type": "string", "enum": ["user", "server"],
+                     "description": "user：記在發言者身上；server：全伺服器共享"}},
+          ["content", "scope"]),
+    _tool("recall", "搜尋記憶（包含伺服器裡其他人的記憶）",
+          {"query": {"type": "string", "description": "關鍵字或人名，多個用空白分隔"}}, ["query"]),
+    _tool("forget", "刪除一條記憶",
+          {"memory_id": {"type": "integer", "description": "記憶編號（#後面的數字）"}}, ["memory_id"]),
+]
+REACTION_TOOL = _tool("add_reaction", "幫最後一則訊息按一個表情符號",
+                      {"emoji": {"type": "string", "description": "一個 Unicode emoji，例如 😂"}}, ["emoji"])
 
 
-async def run_tool(name: str, args: dict, message: discord.Message) -> str:
+def tools_for(turn: ChatTurn) -> list[dict]:
+    if turn.chime_in:
+        return [REACTION_TOOL]   # 主動插話時不准點歌、記東西或上網
+    tools = (MUSIC_TOOLS if turn.message.guild else []) + MEMORY_TOOLS + [REACTION_TOOL]
+    return tools + bot.mcp.tools
+
+
+def tool_status(name: str, args: dict) -> str | None:
+    """串流訊息上顯示的工具進度"""
+    return {
+        "play_music": f"🎵 點歌：{args.get('query', '')}",
+        "skip_song": "⏭️ 切歌中",
+        "get_queue": "📋 查看佇列",
+        "remember": f"🧠 記住：{args.get('content', '')}",
+        "recall": "🧠 回想中",
+        "forget": "🧠 忘記中",
+        "add_reaction": None,
+        "searxng_web_search": f"🔍 搜尋：{args.get('query', '')}",
+        "web_url_read": "📖 閱讀網頁",
+        "calculate": "🧮 計算中",
+    }.get(name, f"🔧 {name}")
+
+
+async def run_tool(name: str, args: dict, turn: ChatTurn) -> str:
     """執行模型要求的工具，回傳給模型看的結果文字。"""
+    message = turn.message
     log.info("聊天工具 %s %s（%s）", name, args, message.author)
     guild = message.guild
+    gid = memory_guild_id(message)
     if name == "play_music":
         voice = getattr(message.author, "voice", None)
         if not voice or not voice.channel:
@@ -611,23 +922,61 @@ async def run_tool(name: str, args: dict, message: discord.Message) -> str:
         return "已跳過"
     if name == "get_queue":
         return format_queue(bot.player(guild))
+    if name == "remember":
+        content = str(args.get("content", "")).strip()[:200]
+        if not content:
+            return "記憶內容是空的"
+        shared = args.get("scope") == "server" and guild is not None
+        user_id = None if shared else message.author.id
+        if bot.memory.count(gid, user_id) >= MEMORY_MAX_PER_SCOPE:
+            return "記憶已滿，請先用 forget 刪掉不重要的再記"
+        mid = bot.memory.add(gid, user_id, None if shared else message.author.display_name, content, message.author.id)
+        return f"已記住 #{mid}（{'伺服器共同記憶' if shared else message.author.display_name}）：{content}"
+    if name == "recall":
+        found = bot.memory.search(gid, str(args.get("query", "")).split())
+        if not found:
+            return "沒有找到相關記憶"
+        return "\n".join(f"#{m.id} [{m.user_name or '伺服器'}] {m.content}" for m in found)
+    if name == "forget":
+        try:
+            mem = bot.memory.get(gid, int(args.get("memory_id")))
+        except (TypeError, ValueError):
+            mem = None
+        if mem is None:
+            return "找不到這條記憶"
+        if mem.user_id not in (None, message.author.id):
+            return f"這是 {mem.user_name} 的個人記憶，只有本人可以要求刪除"
+        bot.memory.delete(gid, mem.id)
+        return f"已忘記 #{mem.id}：{mem.content}"
+    if name == "add_reaction":
+        try:
+            await message.add_reaction(str(args.get("emoji", "")).strip())
+        except discord.HTTPException:
+            return "無法使用這個表情，請換一個標準 emoji"
+        turn.reacted = True
+        return "已按表情"
     if bot.mcp.has(name):
         return await bot.mcp.call(name, args)
     return f"未知的工具：{name}"
 
 
-async def chat_reply(bot: MusicBot, message: discord.Message) -> str:
+async def chat_reply(bot: MusicBot, turn: ChatTurn) -> str:
     """呼叫 LLM；如果它要求工具就執行並把結果餵回去，直到它給出文字回覆。"""
-    messages = await build_chat_messages(bot, message)
+    messages = await build_chat_messages(bot, turn.message, turn.chime_in)
+    live = turn.live
+    on_delta = None
+    if live:
+        def on_delta(reasoning: str, content: str):
+            live.update(text=clean_reply(content))
+
     for round_ in range(CHAT_MAX_TOOL_ROUNDS + 1):
         if round_ < CHAT_MAX_TOOL_ROUNDS:
-            # 音樂工具只在伺服器裡有用；MCP 工具私訊也能用
-            tools = (CHAT_TOOLS if message.guild else []) + bot.mcp.tools or None
+            tools = tools_for(turn)
         else:
             # 最後一輪不給工具，並明確要它收尾，否則它會把工具呼叫當文字吐出來
             tools = None
             messages.append({"role": "user", "content": "（系統提示：工具使用次數已達上限，請根據目前取得的資訊直接回覆。）"})
-        reply = await chat_completion(bot.http_session, messages, tools)
+        reply = await chat_completion(bot.http_session, messages, tools, on_delta)
         calls = reply.get("tool_calls")
         if not calls:
             return clean_reply(reply.get("content"))
@@ -637,9 +986,59 @@ async def chat_reply(bot: MusicBot, message: discord.Message) -> str:
                 args = json.loads(call["function"].get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            result = await run_tool(call["function"]["name"], args, message)
+            name = call["function"]["name"]
+            if live and (status := tool_status(name, args)):
+                live.update(text="", status=status)
+            result = await run_tool(name, args, turn)
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
+        if live:
+            live.update(text="", status=THINKING_PLACEHOLDER)
     return ""
+
+
+# ---------- /memory 指令 ----------
+
+memory_group = app_commands.Group(name="memory", description="查看或管理機器人的長期記憶")
+
+
+@memory_group.command(name="list", description="查看機器人記得的關於你的事，以及伺服器共同記憶")
+async def memory_list(interaction: discord.Interaction):
+    gid = interaction.guild.id if interaction.guild else 0
+    mine = bot.memory.list_for(gid, interaction.user.id)
+    lines = ["**關於你：**"] + [f"`#{m.id}` {m.content}" for m in mine] if mine else ["關於你還沒有任何記憶"]
+    if interaction.guild:
+        shared = bot.memory.list_for(gid, None)
+        lines += ["", "**伺服器共同記憶：**"] + ([f"`#{m.id}` {m.content}" for m in shared] or ["（無）"])
+    await interaction.response.send_message("\n".join(lines)[:2000], ephemeral=True)
+
+
+@memory_group.command(name="forget", description="刪除一條記憶（自己的，或伺服器共同記憶）")
+@app_commands.describe(memory_id="記憶編號（/memory list 裡 # 後面的數字）")
+async def memory_forget(interaction: discord.Interaction, memory_id: int):
+    gid = interaction.guild.id if interaction.guild else 0
+    mem = bot.memory.get(gid, memory_id)
+    if mem is None:
+        return await interaction.response.send_message("找不到這條記憶", ephemeral=True)
+    if mem.user_id is not None and mem.user_id != interaction.user.id:
+        return await interaction.response.send_message("只能刪除自己的記憶", ephemeral=True)
+    bot.memory.delete(gid, memory_id)
+    await interaction.response.send_message(f"🗑️ 已刪除 #{memory_id}：{mem.content}", ephemeral=True)
+
+
+@memory_group.command(name="summary", description="查看這個頻道目前的對話摘要")
+async def memory_summary(interaction: discord.Interaction):
+    summary = bot.memory.get_summary(interaction.channel_id)
+    text = f"**頻道摘要：**\n{summary[0]}" if summary else "這個頻道還沒有摘要（訊息累積夠多後會自動產生）"
+    await interaction.response.send_message(text[:2000], ephemeral=True)
+
+
+@memory_group.command(name="reset_summary", description="清除這個頻道的對話摘要")
+async def memory_reset_summary(interaction: discord.Interaction):
+    bot.memory.clear_summary(interaction.channel_id)
+    await interaction.response.send_message("🧹 已清除這個頻道的摘要", ephemeral=True)
+
+
+bot.tree.add_command(memory_group)
 
 
 @bot.tree.command(name="play", description="播放 YouTube 網址、播放清單或搜尋關鍵字")

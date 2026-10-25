@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# 機器人的記憶資料庫
+data/
+
 # YouTube cookies（含帳號登入資訊）
 cookies.txt
 *.cookies.txt

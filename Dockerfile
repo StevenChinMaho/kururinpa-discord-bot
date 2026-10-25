@@ -10,7 +10,7 @@ COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py .
+COPY bot.py memory.py ./
 
 # 每次啟動先更新 yt-dlp（YouTube 常改版，舊版很快就會壞）
 CMD ["sh", "-c", "pip install -q -U --no-cache-dir 'yt-dlp[default]' && exec python bot.py"]
