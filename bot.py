@@ -55,6 +55,7 @@ CHAT_SYSTEM_PROMPT = os.environ.get("CHAT_SYSTEM_PROMPT") or (
 CHAT_FOCUS_PROMPT = (
     "只回應最後一則訊息；前面的對話紀錄只是背景參考，用來理解話題，"
     "除非最後一則訊息有提到，否則不要主動評論或回應前面其他人的訊息。"
+    "使用者訊息開頭的 [月/日 時:分] 是發送時間，可以用來判斷事情發生多久了；你的回覆不要加時間或名稱前綴。"
 )
 CHAT_TOOL_PROMPT = (
     "你可以用工具真的操作音樂播放：有人想聽歌或要你點歌時呼叫 play_music（一次一首，要多首就分多次呼叫），"
@@ -88,6 +89,7 @@ SUMMARY_MAX_FETCH = 200    # 一次最多壓縮幾則
 SUMMARY_PROMPT = (
     "你負責整理 Discord 頻道的對話摘要。把「先前摘要」和「新的對話」合併成一份新的摘要："
     "用繁體中文條列重點（誰聊了什麼話題、做了什麼決定、有什麼還沒完的事、重要的梗），保留人名，"
+    "提到約定或事件時寫上日期（對話每行開頭的 [月/日 時:分] 是發送時間），"
     "去掉寒暄和沒有意義的內容，舊的瑣事可以刪減，總長不超過 400 字。只輸出摘要本身。"
 )
 
@@ -228,9 +230,16 @@ class BufferedPCMAudio(discord.AudioSource):
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # 模型偶爾會把工具呼叫或思考標籤當成純文字吐出來，不能顯示給使用者
 LEAKED_TAGS_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|$)|</?think>", re.DOTALL)
+# 模型模仿對話紀錄格式時，回覆開頭可能多出「[10/26 14:03] 名字：」
+LEAKED_PREFIX_RE = re.compile(r"^\[\d{1,2}/\d{1,2} \d{1,2}:\d{2}\]\s*(?:[^：\n]{1,32}：)?")
 
 
 THINKING_PLACEHOLDER = "💭 思考中"
+
+
+def stamp(m: discord.Message) -> str:
+    """訊息的發送時間（本地時區），例如 [10/26 14:03]"""
+    return f"[{m.created_at.astimezone():%m/%d %H:%M}]"
 
 
 def history_text(bot: commands.Bot, m: discord.Message) -> str | None:
@@ -282,7 +291,7 @@ async def build_chat_messages(bot: commands.Bot, message: discord.Message, chime
         if m.author.id == bot.user.id:
             messages.append({"role": "assistant", "content": text})
         else:
-            messages.append({"role": "user", "content": f"{m.author.display_name}：{text}"})
+            messages.append({"role": "user", "content": f"{stamp(m)} {m.author.display_name}：{text}"})
     if chime_in:
         messages.append({"role": "user", "content": CHAT_CHIME_IN_PROMPT})
     return messages
@@ -424,7 +433,7 @@ async def summarize_channel(bot: commands.Bot, channel: discord.abc.Messageable)
     after = discord.Object(id=last_id) if last_id else None
     pending = [m async for m in channel.history(limit=SUMMARY_MAX_FETCH, before=recent[-1], after=after)]
     pending.sort(key=lambda m: m.id)
-    lines = [f"{m.author.display_name}：{t}" for m in pending if (t := history_text(bot, m))]
+    lines = [f"{stamp(m)} {m.author.display_name}：{t}" for m in pending if (t := history_text(bot, m))]
     if len(lines) < SUMMARY_TRIGGER:
         return
 
@@ -439,7 +448,8 @@ async def summarize_channel(bot: commands.Bot, channel: discord.abc.Messageable)
 
 
 def clean_reply(text: str | None) -> str:
-    return LEAKED_TAGS_RE.sub("", THINK_RE.sub("", text or "")).strip()
+    text = LEAKED_TAGS_RE.sub("", THINK_RE.sub("", text or "")).strip()
+    return LEAKED_PREFIX_RE.sub("", text).strip()
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
