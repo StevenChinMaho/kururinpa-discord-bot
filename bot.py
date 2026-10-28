@@ -40,7 +40,6 @@ CHAT_HISTORY = int(os.environ.get("CHAT_HISTORY", "20"))    # 聊天時讀取頻
 CHAT_NAMES = [n.strip() for n in os.environ.get("CHAT_NAMES", "").split(",") if n.strip()]
 CHAT_CHIME_IN = float(os.environ.get("CHAT_CHIME_IN", "0.03"))                 # 沒被叫到時主動插話的機率（0 關閉）
 CHAT_CHIME_IN_COOLDOWN = int(os.environ.get("CHAT_CHIME_IN_COOLDOWN", "600"))  # 同頻道主動插話的最短間隔（秒）
-STREAM_EDIT_INTERVAL = 1.5   # 串流時多久編輯一次訊息（Discord 限制每 5 秒約 5 次）
 CHAT_THINKING = os.environ.get("CHAT_THINKING", "true").lower() in ("1", "true", "yes", "on")  # 回覆前先思考（較慢但較聰明）
 # 思考力度：xhigh / medium / low，由模型的 chat template 轉成 system 指示（軟性引導）
 CHAT_REASONING_EFFORT = os.environ.get("CHAT_REASONING_EFFORT", "xhigh")
@@ -234,6 +233,7 @@ LEAKED_TAGS_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|$)|</?think>", re.DO
 LEAKED_PREFIX_RE = re.compile(r"^\[\d{1,2}/\d{1,2} \d{1,2}:\d{2}\]\s*(?:[^：\n]{1,32}：)?")
 
 
+# 舊版串流回覆留在頻道裡的「思考中」訊息與「-# 💭 N 秒」頁尾，讀歷史時要濾掉
 THINKING_PLACEHOLDER = "💭 思考中"
 
 
@@ -243,7 +243,7 @@ def stamp(m: discord.Message) -> str:
 
 
 def history_text(bot: commands.Bot, m: discord.Message) -> str | None:
-    """把一則頻道訊息轉成給模型看的文字；機器人自己的訊息去掉思考中提示與頁尾小字。"""
+    """把一則頻道訊息轉成給模型看的文字；機器人自己的訊息去掉舊版的思考中提示與頁尾小字。"""
     text = m.clean_content.strip()
     if m.author.id == bot.user.id:
         if text.startswith(THINKING_PLACEHOLDER):
@@ -301,19 +301,16 @@ async def chat_completion(
     session: aiohttp.ClientSession,
     messages: list[dict],
     tools: list[dict] | None = None,
-    on_delta=None,
     thinking: bool = CHAT_THINKING,
     answer_tokens: int = CHAT_ANSWER_TOKENS,
 ) -> dict:
-    """回傳 assistant message（可能含 tool_calls）。
-    給了 on_delta(reasoning, content) 就用串流，每收到一段就以目前累積的文字呼叫它。"""
+    """回傳 assistant message（可能含 tool_calls）。"""
     headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
     payload = {
         "messages": messages,
         "max_tokens": answer_tokens + (CHAT_THINKING_BUDGET if thinking else 0),
         "chat_template_kwargs": {"enable_thinking": thinking, "reasoning_effort": CHAT_REASONING_EFFORT},
         "reasoning_format": "deepseek",   # 思考內容放到 reasoning_content，不混進回覆
-        "stream": on_delta is not None,
     }
     if thinking:
         payload["thinking_budget_tokens"] = CHAT_THINKING_BUDGET   # llama.cpp 會在預算用完時插入 </think> 強制作答
@@ -321,106 +318,8 @@ async def chat_completion(
         payload["tools"] = tools
     async with session.post(f"{LLAMA_API_URL}/chat/completions", json=payload, headers=headers) as resp:
         resp.raise_for_status()
-        if on_delta is None:
-            data = await resp.json()
-            return data["choices"][0]["message"]
-
-        # SSE：每行 "data: {...}"，tool_calls 依 index 分段送來，要自己拼起來
-        reasoning, content, calls = "", "", {}
-        async for raw in resp.content:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                continue   # 讀到連線結束為止，提早 break 會讓壞掉的連線被重用
-            chunk = json.loads(data)
-            if not chunk.get("choices"):
-                continue
-            delta = chunk["choices"][0].get("delta") or {}
-            reasoning += delta.get("reasoning_content") or ""
-            content += delta.get("content") or ""
-            for tc in delta.get("tool_calls") or []:
-                call = calls.setdefault(tc.get("index", 0), {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                call["id"] = tc.get("id") or call["id"]
-                fn = tc.get("function") or {}
-                call["function"]["name"] += fn.get("name") or ""
-                call["function"]["arguments"] += fn.get("arguments") or ""
-            on_delta(reasoning, content)
-
-    msg = {"role": "assistant", "content": content, "reasoning_content": reasoning}
-    if calls:
-        msg["tool_calls"] = [calls[i] for i in sorted(calls)]
-    return msg
-
-
-class LiveReply:
-    """先回一則「思考中」訊息，生成過程中節流地編輯它，避免撞到 Discord 的編輯頻率限制。"""
-
-    def __init__(self, source: discord.Message):
-        self.source = source
-        self.msg: discord.Message | None = None
-        self.status = THINKING_PLACEHOLDER
-        self.text = ""
-        self.started = time.monotonic()
-        self._shown = ""
-        self._task: asyncio.Task | None = None
-
-    def elapsed(self) -> int:
-        return int(time.monotonic() - self.started)
-
-    async def start(self):
-        self.msg = await self.source.reply(f"{self.status}…", mention_author=False)
-        self._shown = self.msg.content
-        self._task = asyncio.create_task(self._loop())
-
-    def update(self, text: str | None = None, status: str | None = None):
-        if text is not None:
-            self.text = text
-        if status is not None:
-            self.status = status
-
-    def _render(self) -> str:
-        if self.text:
-            text = self.text if len(self.text) <= 1900 else self.text[:1900] + " …"
-            return text + " ▌"
-        return f"{self.status}…（{self.elapsed()} 秒）"
-
-    async def _loop(self):
-        while True:
-            await asyncio.sleep(STREAM_EDIT_INTERVAL)
-            content = self._render()
-            if content != self._shown:
-                try:
-                    await self.msg.edit(content=content)
-                    self._shown = content
-                except discord.HTTPException:
-                    pass
-
-    async def _stop(self):
-        if self._task:
-            self._task.cancel()
-            self._task = None
-
-    async def finish(self, text: str):
-        await self._stop()
-        footer = f"\n-# 💭 {self.elapsed()} 秒"
-        chunks = split_message(text, limit=2000 - len(footer)) or [""]
-        chunks[-1] += footer
-        await self.msg.edit(content=chunks[0])
-        for chunk in chunks[1:]:
-            await self.source.channel.send(chunk)
-
-    async def delete(self):
-        await self._stop()
-        try:
-            await self.msg.delete()
-        except discord.HTTPException:
-            pass
-
-    async def fail(self, text: str):
-        await self._stop()
-        await self.msg.edit(content=text)
+        data = await resp.json()
+    return data["choices"][0]["message"]
 
 
 async def summarize_channel(bot: commands.Bot, channel: discord.abc.Messageable):
@@ -675,10 +574,7 @@ class MusicBot(commands.Bot):
 
     async def setup_hook(self):
         if LLAMA_API_URL:
-            # 不重用連線：串流回應結束後 llama.cpp 會關閉連線，重用會遇到 ServerDisconnectedError
-            self.http_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=600), connector=aiohttp.TCPConnector(force_close=True)
-            )
+            self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600))
             await self.mcp.start()
             log.info("聊天功能已啟用：%s", LLAMA_API_URL)
         if GUILD_ID:
@@ -730,37 +626,27 @@ class MusicBot(commands.Bot):
         return random.random() < CHAT_CHIME_IN
 
     async def _chat(self, message: discord.Message):
-        try:
-            await message.add_reaction("👀")
-        except discord.HTTPException:
-            pass
-        live = LiveReply(message)
-        await live.start()
-        turn = ChatTurn(message, live)
+        turn = ChatTurn(message)
         self.active_chats += 1
         try:
-            reply = await chat_reply(self, turn)
+            async with message.channel.typing():
+                reply = await chat_reply(self, turn)
         except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, json.JSONDecodeError) as e:
             log.warning("聊天失敗：%r", e)
-            await live.fail("⚠️ AI 暫時連不上，等等再試試")
+            await message.reply("⚠️ AI 暫時連不上，等等再試試", mention_author=False)
             return
         except Exception:  # noqa: BLE001
             log.exception("聊天發生非預期錯誤")
-            await live.fail("⚠️ 出了點問題，等等再試試")
+            await message.reply("⚠️ 出了點問題，等等再試試", mention_author=False)
             return
         finally:
             self.active_chats -= 1
-            try:
-                await message.remove_reaction("👀", self.user)
-            except discord.HTTPException:
-                pass
 
-        if reply:
-            await live.finish(reply)
-        elif turn.reacted:
-            await live.delete()   # 只按了表情，不用多一則空訊息
-        else:
-            await live.finish("……（AI 沒有回應）")
+        if reply or not turn.reacted:   # 只按了表情就不用再多一則訊息
+            chunks = split_message(reply) or ["……（AI 沒有回應）"]
+            await message.reply(chunks[0], mention_author=False)
+            for chunk in chunks[1:]:
+                await message.channel.send(chunk)
         self.schedule_summary(message.channel)
 
     async def _chime_in(self, message: discord.Message):
@@ -867,7 +753,6 @@ def format_queue(player: GuildPlayer) -> str:
 class ChatTurn:
     """一次聊天回覆的狀態"""
     message: discord.Message           # 觸發回覆的訊息
-    live: LiveReply | None = None      # 串流顯示用；主動插話時為 None
     chime_in: bool = False
     reacted: bool = False
 
@@ -906,22 +791,6 @@ def tools_for(turn: ChatTurn) -> list[dict]:
         return [REACTION_TOOL]   # 主動插話時不准點歌、記東西或上網
     tools = (MUSIC_TOOLS if turn.message.guild else []) + MEMORY_TOOLS + [REACTION_TOOL]
     return tools + bot.mcp.tools
-
-
-def tool_status(name: str, args: dict) -> str | None:
-    """串流訊息上顯示的工具進度"""
-    return {
-        "play_music": f"🎵 點歌：{args.get('query', '')}",
-        "skip_song": "⏭️ 切歌中",
-        "get_queue": "📋 查看佇列",
-        "remember": f"🧠 記住：{args.get('content', '')}",
-        "recall": "🧠 回想中",
-        "forget": "🧠 忘記中",
-        "add_reaction": None,
-        "searxng_web_search": f"🔍 搜尋：{args.get('query', '')}",
-        "web_url_read": "📖 閱讀網頁",
-        "calculate": "🧮 計算中",
-    }.get(name, f"🔧 {name}")
 
 
 async def run_tool(name: str, args: dict, turn: ChatTurn) -> str:
@@ -1000,12 +869,6 @@ async def _run_tool(name: str, args: dict, turn: ChatTurn) -> str:
 async def chat_reply(bot: MusicBot, turn: ChatTurn) -> str:
     """呼叫 LLM；如果它要求工具就執行並把結果餵回去，直到它給出文字回覆。"""
     messages = await build_chat_messages(bot, turn.message, turn.chime_in)
-    live = turn.live
-    on_delta = None
-    if live:
-        def on_delta(reasoning: str, content: str):
-            live.update(text=clean_reply(content))
-
     for round_ in range(CHAT_MAX_TOOL_ROUNDS + 1):
         if round_ < CHAT_MAX_TOOL_ROUNDS:
             tools = tools_for(turn)
@@ -1013,7 +876,7 @@ async def chat_reply(bot: MusicBot, turn: ChatTurn) -> str:
             # 最後一輪不給工具，並明確要它收尾，否則它會把工具呼叫當文字吐出來
             tools = None
             messages.append({"role": "user", "content": "（系統提示：工具使用次數已達上限，請根據目前取得的資訊直接回覆。）"})
-        reply = await chat_completion(bot.http_session, messages, tools, on_delta)
+        reply = await chat_completion(bot.http_session, messages, tools)
         calls = reply.get("tool_calls")
         if not calls:
             return clean_reply(reply.get("content"))
@@ -1023,13 +886,8 @@ async def chat_reply(bot: MusicBot, turn: ChatTurn) -> str:
                 args = json.loads(call["function"].get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            name = call["function"]["name"]
-            if live and (status := tool_status(name, args)):
-                live.update(text="", status=status)
-            result = await run_tool(name, args, turn)
+            result = await run_tool(call["function"]["name"], args, turn)
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
-        if live:
-            live.update(text="", status=THINKING_PLACEHOLDER)
     return ""
 
 
