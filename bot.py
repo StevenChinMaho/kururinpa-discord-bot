@@ -233,6 +233,10 @@ LEAKED_TAGS_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|$)|</?think>", re.DO
 LEAKED_PREFIX_RE = re.compile(r"^\[\d{1,2}/\d{1,2} \d{1,2}:\d{2}\]\s*(?:[^：\n]{1,32}：)?")
 
 
+# 主動插話時模型表示「不說話」的標記；它不一定照規定寫 [PASS]，也可能自己編 [HOLD] 之類的
+SILENCE_MARKER_RE = re.compile(r"\[[A-Z_]{3,}\]")
+
+
 # 舊版串流回覆留在頻道裡的「思考中」訊息與「-# 💭 N 秒」頁尾，讀歷史時要濾掉
 THINKING_PLACEHOLDER = "💭 思考中"
 
@@ -246,7 +250,7 @@ def history_text(bot: commands.Bot, m: discord.Message) -> str | None:
     """把一則頻道訊息轉成給模型看的文字；機器人自己的訊息去掉舊版的思考中提示與頁尾小字。"""
     text = m.clean_content.strip()
     if m.author.id == bot.user.id:
-        if text.startswith(THINKING_PLACEHOLDER):
+        if text.startswith(THINKING_PLACEHOLDER) or SILENCE_MARKER_RE.fullmatch(text):
             return None
         text = "\n".join(line for line in text.splitlines() if not line.startswith("-# ")).strip()
     return text or None
@@ -660,7 +664,7 @@ class MusicBot(commands.Bot):
             return
         finally:
             self.active_chats -= 1
-        reply = reply.replace("[PASS]", "").strip()
+        reply = SILENCE_MARKER_RE.sub("", reply).strip()
         log.info("主動插話（%s）：%s", message.channel, reply or ("按了表情" if turn.reacted else "略過"))
         if reply:
             for chunk in split_message(reply):
@@ -888,6 +892,8 @@ async def chat_reply(bot: MusicBot, turn: ChatTurn) -> str:
                 args = {}
             result = await run_tool(call["function"]["name"], args, turn)
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
+        if turn.chime_in and turn.reacted:
+            return ""   # 主動插話按完表情就結束，不用再花一輪 LLM 想要不要說話
     return ""
 
 
