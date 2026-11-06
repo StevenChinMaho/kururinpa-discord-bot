@@ -72,7 +72,7 @@ docker compose logs -f
 聊天時 AI 會自動使用 [mcp_servers.json](mcp_servers.json) 裡設定的 MCP server：
 
 - **calculator**：數學計算
-- **searxng**：網路搜尋與讀取網頁，搜尋引擎是 docker-compose 裡一起啟動的自架 SearXNG（不對外開 port）
+- **searxng**：網路搜尋與讀取網頁，搜尋引擎是獨立部署的自架 SearXNG（`~/searxng`，不對外開 port，要先啟動）
 
 格式和 Claude Desktop 相同（`command` / `args` / `env`），另外可以用 `tools` 限制只開放部分工具。
 Python 套件的 server 要加進 `requirements.txt`；npm 套件的 server 用 `deno run -A npm:套件名` 執行，不用另外裝 Node。
